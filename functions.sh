@@ -92,170 +92,124 @@ info_ok
 ################################ portworx ##############################
 function portworx () {
 
-# from https://gist.github.com/clemenko/00dcbb344476aafda18dbae207952d71
+echo -e  " - adding px-csi"
 
-# add volumes
-echo -e -n " - px - checking volumes"
-if [ "$(doctl compute volume list --no-header | wc -l | xargs )" != 0 ]; then echo -e -n " "$GREEN"- detected -";
+host_list=$(cat ip.txt | awk '{printf $2","}' | sed 's/,$//')
 
-else
-  echo -e -n " - adding"
-  for num in 1 2 3; do
-    doctl compute volume-action attach $(doctl compute volume create port$num --region nyc1 --size 60GiB | grep -v ID| awk '{print $1}') $(doctl compute droplet list | grep rke$num | awk '{print $1}') > /dev/null 2>&1
-  done
-fi
-
+echo -e -n "   - adding multipath"
+pdsh -l root -w $host_list 'cat << EOF >> /etc/multipath.conf
+devices {
+    device {
+        vendor                      "NVME"
+        product                     "Pure Storage FlashArray"
+        path_selector               "queue-length 0"
+        path_grouping_policy        group_by_prio
+        prio                        ana
+        failback                    immediate
+        fast_io_fail_tmo            10
+        user_friendly_names         no
+        no_path_retry               0
+        features                    0
+        dev_loss_tmo                60
+    }
+    device {
+        vendor                   "PURE"
+        product                  "FlashArray"
+        path_selector            "service-time 0"
+        hardware_handler         "1 alua"
+        path_grouping_policy     group_by_prio
+        prio                     alua
+        failback                 immediate
+        path_checker             tur
+        fast_io_fail_tmo         10
+        user_friendly_names      no
+        no_path_retry            0
+        features                 0
+        dev_loss_tmo             600
+    }
+}
+blacklist_exceptions {
+    property "(SCSI_IDENT_|ID_WWN)"
+}
+blacklist {
+    devnode "^pxd[0-9]*"
+    devnode "^pxd*"
+    device {
+        vendor "VMware"
+        product "Virtual disk"
+    }
+    device {
+        vendor "IET"
+        product "VIRTUAL-DISK"
+    }
+}
+EOF
+yum install -y device-mapper-multipath
+systemctl restart multipathd' > /dev/null 2>&1
 info_ok
 
-echo -e -n " - px - adding operator and storagecluster - "$RED"can take about 15 min"$NO_COLOR""
-# operator
-echo -e -n " ."
-kubectl apply -f 'https://install.portworx.com/3.3?comp=pxoperator&kbver=1.31.0&ns=portworx' > /dev/null 2>&1
-sleep 15
-echo -e -n " ."
+# get latest version of PX-CSI
+PX_CSI_VER=$(curl -sL https://dzver.rfed.io/json | jq -r .portworx)
+
+# create namespace
+kubectl create ns portworx > /dev/null 2>&1
+
+# create and add secret
+cat << EOF > pure.json 
+{
+    "FlashArrays": [
+        {
+            "MgmtEndPoint": "192.168.1.11",
+            "APIToken": "934f95b6-6d1d-ee91-d210-6ed9bce13ad1",
+            "NFSEndPoint": "192.168.1.8"
+        }
+    ]
+}
+EOF
+
+kubectl create secret generic px-pure-secret -n portworx --from-file=pure.json=pure.json > /dev/null 2>&1
+
+echo -e -n "   - adding operator and storaecluster"
+
+# apply operator yaml
+kubectl apply -f 'https://install.portworx.com/'$PX_CSI_VER'?comp=pxoperator&oem=px-csi&kbver=1.33.5&ns=portworx' > /dev/null 2>&1
+
 kubectl wait --for condition=containersready -n portworx pod --all > /dev/null 2>&1
 
-# StorageCluster spec
-echo -e -n " ."
-kubectl apply -f 'https://install.portworx.com/3.3?operator=true&mc=false&kbver=1.31.0&ns=portworx&b=true&iop=6&c=px-cluster1&stork=true&csi=true&mon=true&tel=false&st=k8s&promop=true' > /dev/null 2>&1 
-sleep 60
-echo -e -n " ."
-kubectl wait --for condition=Ready -n portworx pod --all --timeout=60000s   > /dev/null 2>&1
+sleep 10
 
-# make a default storage class
-echo -e -n " ."
-until [ $(kubectl get sc | grep px-csi | wc -l | xargs) = 8 ]; do sleep 5; done
-kubectl patch storageclass px-csi-db -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}' > /dev/null 2>&1 
-
-info_ok
-
-echo -e -n " - px - adding central"
-
-helm upgrade -i px-central px-central --repo http://charts.portworx.io/ -n px-central --create-namespace --set persistentStorage.enabled=true,persistentStorage.storageClassName="px-csi-db",service.pxCentralUIServiceType="ClusterIP",pxbackup.enabled=true,pxmonitor.enabled=false,installCRDs=true > /dev/null 2>&1
-
-until [ $(kubectl get pod -n px-central | wc -l | xargs ) -gt 16 ]; do sleep 5; echo -e -n "."; done
-
-cat <<EOF | kubectl apply -n px-central -f - > /dev/null 2>&1 
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+cat << EOF | kubectl apply -n portworx  -f -
+kind: StorageCluster
+apiVersion: core.libopenstorage.org/v1
 metadata:
-  name: px-central-ui
-  namespace: px-central
+  name: px-cluster
+  namespace: portworx
+  annotations:
+    portworx.io/misc-args: "--oem px-csi"
+    #portworx.io/health-check: "skip"
 spec:
-  rules:
-  - host: central.$domain
-    http:
-      paths:
-      - backend:
-          service:
-            name: px-central-ui
-            port:
-              number: 80
-        path: /
-        pathType: ImplementationSpecific
+  image: portworx/px-pure-csi-driver:$PX_CSI_VER
+  imagePullPolicy: IfNotPresent
+  csi:
+    enabled: true
+  monitoring:
+    telemetry:
+      enabled: false
+    prometheus:
+      enabled: false
+      exportMetrics: false
+  env:
+  - name: PURE_FLASHARRAY_SAN_TYPE
+    value: "ISCSI"
 EOF
 
-info_ok
+sleep 30
 
-echo -e -n " - px - adding grafana"
+kubectl wait --for condition=containersready -n portworx pod --all > /dev/null 2>&1
 
-export PX_URL="https://docs.portworx.com/samples/portworx-enterprise/k8s/pxc"
-
-# create config maps
-kubectl create configmap -n portworx  grafana-dashboard-config --from-literal=grafana-dashboard-config.yaml="$(curl -sk $PX_URL/grafana-dashboard-config.yaml)" > /dev/null 2>&1
-kubectl create configmap -n portworx  grafana-source-config --from-literal=grafana-dashboard-config.yaml="$(curl -sk $PX_URL/grafana-datasource.yaml)" > /dev/null 2>&1
-
-# dashboards
-kubectl -n portworx create configmap grafana-dashboards \
---from-literal=portworx-cluster-dashboard.json="$(curl -sk $PX_URL/portworx-cluster-dashboard.json)" \
---from-literal=portworx-performance-dashboard.json="$(curl -sk $PX_URL/portworx-performance-dashboard.json)" \
---from-literal=portworx-node-dashboard.json="$(curl -sk $PX_URL/portworx-node-dashboard.json)" \
---from-literal=portworx-volume-dashboard.json="$(curl -sk $PX_URL/portworx-volume-dashboard.json)" \
---from-literal=portworx-etcd-dashboard.json="$(curl -sk $PX_URL/portworx-etcd-dashboard.json)" > /dev/null 2>&1
-
-# install with ingress
-cat << EOF | kubectl apply -n portworx -f - > /dev/null 2>&1
-apiVersion: v1
-kind: Service
-metadata:
-  name: grafana
-  labels:
-    app: grafana
-spec:
-  type: ClusterIP
-  ports:
-    - port: 3000
-  selector:
-    app: grafana
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: grafana
-  labels:
-    app: grafana
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: grafana
-  template:
-    metadata:
-      labels:
-        app: grafana
-    spec:
-      containers:
-        - image: grafana/grafana
-          name: grafana
-          imagePullPolicy: IfNotPresent
-          volumeMounts:
-            - name: grafana-dash-config
-              mountPath: /etc/grafana/provisioning/dashboards
-            - name: dashboard-templates
-              mountPath: /var/lib/grafana/dashboards
-            - name: grafana-source-config
-              mountPath: /etc/grafana/provisioning/datasources
-      volumes:
-        - name: grafana-source-config
-          configMap:
-            name: grafana-source-config
-        - name: grafana-dash-config
-          configMap:
-            name: grafana-dashboard-config
-        - name: dashboard-templates
-          configMap:
-            name: grafana-dashboards
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: grafana
-spec:
-  rules:
-  - host: grafana.$domain
-    http:
-      paths:
-      - backend:
-          service:
-            name: grafana
-            port:
-              number: 3000
-        path: /
-        pathType: ImplementationSpecific
-EOF
+kubectl patch storageclass px-fa-direct-access -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}' > /dev/null 2>&1 
 
 info_ok
-
-
-echo -e -n " - px - webservices up"
-until [[ "$(curl -skL -H "Content-Type: application/json" -o /dev/null -w '%{http_code}' https://central.$domain )" == "200" ]]; do echo -e -n .; sleep 5; done
-
-until [[ "$(curl -skL -H "Content-Type: application/json" -o /dev/null -w '%{http_code}' https://grafana.$domain )" == "200" ]]; do echo -e -n .; sleep 5; done
-
-echo -e ""
-
-info "navigate to - "$BLUE"https://central.$domain "$GREEN"admin / admin"$NO_COLOR""
-info "navigate to - "$BLUE"https://grafana.$domain "$GREEN"admin / admin"$NO_COLOR""
 
 }
 
@@ -353,9 +307,6 @@ function longhorn () {
 ############################# fleet ################################
 function fleet () {
   echo -e -n " fleet-ing"
-  # for downstream clusters
-  # kubectl create secret -n cattle-global-data generic awscred --from-literal=amazonec2credentialConfig-defaultRegion=us-east-1 --from-literal=amazonec2credentialConfig-accessKey=${AWS_ACCESS_KEY} --from-literal=amazonec2credentialConfig-secretKey=${AWS_SECRET_KEY}  > /dev/null 2>&1
-
   kubectl create secret -n cattle-global-data generic docreds --from-literal=digitaloceancredentialConfig-accessToken=${DO_TOKEN} > /dev/null 2>&1
 
   kubectl apply -f https://raw.githubusercontent.com/clemenko/fleet/main/gitrepo.yml > /dev/null 2>&1
@@ -369,15 +320,12 @@ function demo () {
 
   echo -e -n " - flask ";kubectl apply -f https://raw.githubusercontent.com/clemenko/k8s_yaml/master/flask_simple_nginx.yml > /dev/null 2>&1; info_ok
   
-  # echo -e -n " - ghost ";kubectl apply -f https://raw.githubusercontent.com/clemenko/k8s_yaml/refs/heads/master/ghost.yaml > /dev/null 2>&1; info_ok
-  
-
-#  echo -e -n " - harbor"
-#  helm upgrade -i harbor harbor --repo https://helm.goharbor.io -n harbor --create-namespace --set expose.tls.certSource=secret --set expose.tls.secret.secretName=tls-ingress --set expose.tls.enabled=false --set expose.tls.auto.commonName=harbor.$domain --set expose.ingress.hosts.core=harbor.$domain --set persistence.enabled=false --set harborAdminPassword=$password --set externalURL=http://harbor.$domain --set notary.enabled=false > /dev/null 2>&1;
-#  info_ok
+  echo -e -n " - harbor"
+  helm upgrade -i harbor harbor --repo https://helm.goharbor.io -n harbor --create-namespace --set expose.tls.certSource=secret --set expose.tls.secret.secretName=tls-ingress --set expose.tls.enabled=false --set expose.tls.auto.commonName=harbor.$domain --set expose.ingress.hosts.core=harbor.$domain --set persistence.enabled=true --set harborAdminPassword=$password --set externalURL=http://harbor.$domain --set notary.enabled=false > /dev/null 2>&1;
+  info_ok
 
   echo -e -n " - gitea"
-  helm upgrade -i gitea oci://registry-1.docker.io/giteacharts/gitea -n gitea --create-namespace --set gitea.admin.password=$password --set gitea.admin.username=gitea --set persistence.size=500Mi --set ingress.enabled=true --set ingress.hosts[0].host=git.$domain --set ingress.hosts[0].paths[0].path=/ --set ingress.hosts[0].paths[0].pathType=Prefix --set gitea.config.server.DOMAIN=git.$domain --set postgresql-ha.enabled=false --set redis-cluster.enabled=false --set gitea.config.database.DB_TYPE=sqlite3 --set gitea.config.session.PROVIDER=memory  --set gitea.config.cache.ADAPTER=memory --set gitea.config.queue.TYPE=level > /dev/null 2>&1
+  helm upgrade -i gitea oci://registry-1.docker.io/giteacharts/gitea -n gitea --create-namespace --set gitea.admin.password=$password --set gitea.admin.username=gitea --set persistence.size=2500Mi --set ingress.enabled=true --set ingress.hosts[0].host=git.$domain --set ingress.hosts[0].paths[0].path=/ --set ingress.hosts[0].paths[0].pathType=Prefix --set gitea.config.server.DOMAIN=git.$domain --set postgresql-ha.enabled=false --set valkey-cluster.enabled=false --set gitea.config.database.DB_TYPE=sqlite3 --set gitea.config.session.PROVIDER=memory  --set gitea.config.cache.ADAPTER=memory --set gitea.config.queue.TYPE=level > /dev/null 2>&1
 
   # mirror github
   until [ $(curl -s http://git.$domain/explore/repos| grep "<title>" | wc -l) = 1 ]; do sleep 2; echo -n "."; done
@@ -385,92 +333,12 @@ function demo () {
   sleep 5
   
   curl -X POST http://git.$domain/api/v1/repos/migrate -H 'accept: application/json' -H 'authorization: Basic Z2l0ZWE6UGEyMndvcmQ=' -H 'Content-Type: application/json' -d '{ "clone_addr": "https://github.com/clemenko/fleet", "repo_name": "fleet","repo_owner": "gitea"}' > /dev/null 2>&1
+  
+  curl -X POST http://git.$domain/api/v1/repos/migrate -H 'accept: application/json' -H 'authorization: Basic Z2l0ZWE6UGEyMndvcmQ=' -H 'Content-Type: application/json' -d '{ "clone_addr": "https://github.com/clemenko/rancher_caffeine", "repo_name": "rancher_caffeine","repo_owner": "gitea"}' > /dev/null 2>&1
+
   info_ok
 
-#  echo -e -n " - tailscale "
-#  curl -s https://raw.githubusercontent.com/clemenko/k8s_yaml/master/tailscale.yaml  | sed -e "s/XXX/$TAILSCALE_ID/g" -e "s/ZZZ/$TAILSCALE_TOKEN/g" | kubectl apply -f - > /dev/null 2>&1
-#  info_ok
+  echo -e -n " - postgresql "
+  helm upgrade -i postgresql oci://registry-1.docker.io/bitnamicharts/postgresql -n postgresql --create-namespace  --set global.postgresql.auth.postgresPassword=Pa22word,primary.persistence.storageClass=px-fa-direct-access,primary.persistence.size=12Gi > /dev/null 2>&1
+  info_ok
 } 
-
-################################ keycloak ##############################
-function keycloak () {
-  
-  KEY_URL=keycloak.$domain
-  RANCHER_URL=rancher.$domain
-
-  echo -e " keycloaking"
-  echo -e -n " - deploying"
-  
-  kubectl create ns keycloak > /dev/null 2>&1 
-  kubectl -n keycloak create secret tls tls-ingress --cert=/Users/clemenko/Dropbox/work/rfed.me/io/star.rfed.io.cert --key=/Users/clemenko/Dropbox/work/rfed.me/io/star.rfed.io.key > /dev/null 2>&1 
-  # kubectl -n keycloak create secret generic tls-ca --from-file=/Users/clemenko/Dropbox/work/rfed.me/io/cacerts.pem > /dev/null 2>&1 
-
-  curl -s https://raw.githubusercontent.com/clemenko/k8s_yaml/master/keycloak.yml  | sed "s/rfed.xx/$domain/g" | kubectl apply -f - > /dev/null 2>&1
-  
-  info_ok
-  
-  echo -e -n " - waiting for keycloak"
-
-  until [ $(curl -sk https://$KEY_URL/ | grep "Administration Console" | wc -l) = 1 ]; do echo -e -n "." ; sleep 2; done
-  info_ok
-
-  echo -e -n " - adding realm and client"
-
-  # get auth token - notice keycloak's password 
-  export key_token=$(curl -sk -X POST https://$KEY_URL/realms/master/protocol/openid-connect/token -d 'client_id=admin-cli&username=admin&password='$password'&credentialId=&grant_type=password' | jq -r .access_token)
-
-  # add realm
-  curl -sk -X POST https://$KEY_URL/admin/realms -H "authorization: Bearer $key_token" -H 'accept: application/json, text/plain, */*' -H 'content-type: application/json;charset=UTF-8' -d '{"enabled":true,"id":"rancher","realm":"rancher"}'
-
-  # add client
-  curl -sk -X POST https://$KEY_URL/admin/realms/rancher/clients -H "authorization: Bearer $key_token" -H 'accept: application/json, text/plain, */*' -H 'content-type: application/json;charset=UTF-8' -d '{"enabled":true,"attributes":{},"redirectUris":[],"clientId":"rancher","protocol":"openid-connect","publicClient": false,"redirectUris":["https://'$RANCHER_URL'/verify-auth"]}'
-
-  # get client id
-  export client_id=$(curl -sk  https://$KEY_URL/admin/realms/rancher/clients/ -H "authorization: Bearer $key_token"  | jq -r '.[] | select(.clientId=="rancher") | .id')
-
-  # get client_secret
-  export client_secret=$(curl -sk  https://$KEY_URL/admin/realms/rancher/clients/$client_id/client-secret -H "authorization: Bearer $key_token" | jq -r .value)
-
-  # add mappers
-  curl -sk -X POST https://$KEY_URL/admin/realms/rancher/clients/$client_id/protocol-mappers/models -H "authorization: Bearer $key_token" -H 'accept: application/json, text/plain, */*' -H 'content-type: application/json;charset=UTF-8' -d '{"protocol":"openid-connect","config":{"full.path":"true","id.token.claim":"false","access.token.claim":"false","userinfo.token.claim":"true","claim.name":"groups"},"name":"Groups Mapper","protocolMapper":"oidc-group-membership-mapper"}'
-
-  curl -sk -X POST https://$KEY_URL/admin/realms/rancher/clients/$client_id/protocol-mappers/models -H "authorization: Bearer $key_token" -H 'accept: application/json, text/plain, */*' -H 'content-type: application/json;charset=UTF-8' -d '{"protocol":"openid-connect","config":{"id.token.claim":"false","access.token.claim":"true","included.client.audience":"rancher"},"name":"Client Audience","protocolMapper":"oidc-audience-mapper"}' 
-
-  curl -sk -X POST https://$KEY_URL/admin/realms/rancher/clients/$client_id/protocol-mappers/models -H "authorization: Bearer $key_token" -H 'accept: application/json, text/plain, */*' -H 'content-type: application/json;charset=UTF-8' -d '{"protocol":"openid-connect","config":{"full.path":"true","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true","claim.name":"full_group_path"},"name":"Group Path","protocolMapper":"oidc-group-membership-mapper"}'
-
-  # add realm-managementview-users	
-  # get role id
-  # role_ID=$(curl -sk -X GET https://$KEY_URL/admin/realms/rancher/roles -H "authorization: Bearer $key_token" | jq -r '.[]  | select(.name=="default-roles-rancher") | .id')
-  
-  # curl -sk https://$KEY_URL/admin/realms/rancher/roles-by-id/$role_ID/composites -H "authorization: Bearer $key_token"  -d '[{"id":"d8ef39c5-c8b6-4bcc-8010-7244b7e5cf4a","name":"view-users","description":"${role_view-users}"}]'
-
-  # add groups admin / dev
-  curl -k https://$KEY_URL/admin/realms/rancher/groups -H 'Content-Type: application/json' -H "authorization: Bearer $key_token" -d '{"name":"devs"}'
- 
-  curl -k https://$KEY_URL/admin/realms/rancher/groups -H 'Content-Type: application/json' -H "authorization: Bearer $key_token" -d '{"name":"admins"}'
-
- 
-  # add keycloak user clemenko / Pa22word
-  curl -k 'https://'$KEY_URL'/admin/realms/rancher/users' -H 'Content-Type: application/json' -H "authorization: Bearer $key_token" -d '{"enabled":true,"attributes":{},"groups":["/devs"],"credentials":[{"type":"password","value":"'$password'","temporary":false}],"username":"clemenko","emailVerified":"","firstName":"Andy","lastName":"Clemenko"}' 
-
-  # add keycloak user admin / Pa22word
-  curl -k 'https://'$KEY_URL'/admin/realms/rancher/users' -H 'Content-Type: application/json' -H "authorization: Bearer $key_token" -d '{"enabled":true,"attributes":{},"groups":["/admins", "/devs"],"credentials":[{"type":"password","value":"'$password'","temporary":false}],"username":"admin","emailVerified":"","firstName":"Admin","lastName":"Clemenko"}' 
-
-  info_ok
-
-  echo -e -n " - configuring rancher"
-  # configure rancher
-  token=$(curl -sk -X POST https://$RANCHER_URL/v3-public/localProviders/local?action=login -H 'content-type: application/json' -d '{"username":"admin","password":"'$password'"}' | jq -r .token)
-
-  api_token=$(curl -sk https://$RANCHER_URL/v3/token -H 'content-type: application/json' -H "Authorization: Bearer $token" -d '{"type":"token","description":"automation"}' | jq -r .token)
-
-  curl -sk -X PUT https://$RANCHER_URL/v3/keyCloakOIDCConfigs/keycloakoidc?action=testAndEnable -H 'accept: application/json' -H 'accept-language: en-US,en;q=0.9' -H 'content-type: application/json;charset=UTF-8' -H 'content-type: application/json' -H "Authorization: Bearer $api_token" -X PUT -d '{"enabled":true,"id":"keycloakoidc","name":"keycloakoidc","type":"keyCloakOIDCConfig","accessMode":"unrestricted","rancherUrl":"https://rancher.'$domain'/verify-auth","scope":"openid profile email","clientId":"rancher","clientSecret":"'$client_secret'","issuer":"https://keycloak.'$domain'/realms/rancher","authEndpoint":"https://'$KEY_URL'/realms/rancher/protocol/openid-connect/auth/"}' > /dev/null 2>&1
-
-  # login with keycloak user - manual
-
-  info_ok
-
-}
-
-# PSA notes
-# kubectl label ns spark pod-security.kubernetes.io/audit=privileged pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/warn=privileged

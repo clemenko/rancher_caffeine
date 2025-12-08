@@ -28,9 +28,6 @@ command -v pdsh >/dev/null 2>&1 || { fatal "Pdsh was not found. Please install" 
 command -v k3sup >/dev/null 2>&1 || { fatal "K3sup was not found. Please install" ; }
 command -v kubectl >/dev/null 2>&1 || { fatal "Kubectl was not found. Please install" ; }
 
-#### doctl_list ####
-function dolist () { harvester vm |grep -v NAME | grep Run | grep $prefix| awk '{print $1"  "$2"  192.168.1.  "$4"  "$5}'; }
-
 source functions.sh
 
 # update helm
@@ -49,23 +46,27 @@ echo -e -n " - building vms -$build_list"
 harvester vm create --template farock --count $num rke > /dev/null 2>&1 || fatal "vms did not build"
 info_ok
 
-sleep 10; 
+echo -e -n "   - waiting for vms to boot "
+until [ $(harvester vm list | grep Running | wc -l ) = 3 ]; do echo -e -n "." ; sleep 10; done
+sleep 30
+info_ok
 
-dolist > ip.txt
-
-read -p "Press enter to continue after editing ip.txt."
+touch ip.txt
+for i in $(harvester vm list |grep -v NAME | grep Run | grep $prefix | awk '{print $6}'); do 
+  echo $(harvester vm list |grep -v NAME | grep Run | grep $i| awk '{print $2}') " "$(ssh root@$i "ip a show eth0 |grep -w inet | awk '{print \$2}'|sed 's#/24##g'") >> ip.txt
+done
 
 #check for SSH
 echo -e -n " - checking for ssh "
-for ext in $(cat ip.txt | awk '{print $3}'); do
+for ext in $(cat ip.txt | awk '{print $2}'); do
   until [ $(ssh -o ConnectTimeout=1 root@$ext 'exit' 2>&1 | grep 'timed out\|refused' | wc -l) = 0 ]; do echo -e -n "." ; sleep 5; done
 done
 info_ok
 
 #get ips
-host_list=$(cat ip.txt | awk '{printf $3","}' | sed 's/,$//')
-server=$(cat ip.txt | sed -n 1p | awk '{print $3}')
-worker_list=$(cat ip.txt | sed 1d | awk '{printf $3","}' | sed 's/,$//')
+host_list=$(cat ip.txt | awk '{printf $2","}' | sed 's/,$//')
+server=$(cat ip.txt | sed -n 1p | awk '{print $2}')
+worker_list=$(cat ip.txt | sed 1d | awk '{printf $2","}' | sed 's/,$//')
 
 #update DNS
 echo -e -n " - updating dns"
@@ -73,16 +74,8 @@ doctl compute domain records create $domain --record-type A --record-name $prefi
 doctl compute domain records create $domain --record-type CNAME --record-name "*" --record-ttl 60 --record-data $prefix.$domain. > /dev/null 2>&1
 info_ok
 
-sleep 10
-
-#host modifications
-if [[ "$image" = *"ubuntu"* ]]; then
-  echo -e -n " - adding os packages"
-  pdsh -l root -w $host_list 'mkdir -p /opt/kube; systemctl stop ufw; systemctl disable ufw; echo -e "PubkeyAcceptedKeyTypes=+ssh-rsa" >> /etc/ssh/sshd_config; systemctl restart sshd; export DEBIAN_FRONTEND=noninteractive; apt update; apt install nfs-common -y;  #apt upgrade -y; apt autoremove -y' > /dev/null 2>&1
-  info_ok
-fi
-
-if [[ "$image" = *"centos"* || "$image" = *"rocky"* || "$image" = *"alma"* ]]; then centos_packages; fi
+#add centos packagkes
+centos_packages
 
 #kernel tuning from functions
 kernel
@@ -116,19 +109,12 @@ info_ok
 #remove the vms
 function kill () {
 
-if [ ! -z $(dolist | awk '{printf $3","}' | sed 's/,$//') ]; then
   echo -e -n " killing it all "
   harvester vm delete $(harvester vm |grep -v NAME | grep $prefix | awk '{printf $2" "}') > /dev/null 2>&1
-  for i in $(dolist | awk '{print $3}'); do ssh-keygen -q -R $i > /dev/null 2>&1; done
+  for i in $(cat ip.txt | awk '{print $2}'); do ssh-keygen -q -R $i > /dev/null 2>&1; done
   for i in $(doctl compute domain records list $domain|grep rke |awk '{print $1}'); do doctl compute domain records delete -f $domain $i; done
-  until [ $(dolist | wc -l | sed 's/ //g') == 0 ]; do echo -e -n "."; sleep 2; done
-  for i in $(doctl compute volume list --no-header |awk '{print $1}'); do doctl compute volume delete -f $i; done
 
   rm -rf *.txt *.log *.zip *.pub env.* certs backup.tar ~/.kube/config central* sensor* *token kubeconfig *TOKEN 
-
-else
-  echo -e -n " no cluster found "
-fi
 
 info_ok
 }
@@ -137,8 +123,6 @@ case "$1" in
         up) up;;
         kill) kill;;
         px) portworx;;
-        dolist) dolist;;
-        keycloak) keycloak;;
         longhorn) longhorn;;
         rancher) rancher;;
         demo) demo;;

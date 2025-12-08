@@ -1,4 +1,6 @@
-# rancher_caffeine
+# Pure + Rancher: Containers without Complexity
+
+*http://andyc.info/caffeine*
 
 This repo is for the Caffeinate and Collaboriate Webinar.
 
@@ -26,8 +28,23 @@ secret sauce, or the `pure_harvester.sh` command. could go either way.
 
 ## Deploy rke2/Rancher on vms
 
-This script `pure_harvester.sh` has the orders of operation. Worth a look.
+`./pure_harvester.sh rancher`
+
+### Adding PX to the vm cluster
+
+`./pure_harvester.sh px`
+
+### add some apps
+
+`./pure_harvester.sh demo`
 
 ## Other videos
 
 Check out https://andyc.info/tubes
+
+## Want to air gap things
+
+I have a blog for that too : https://github.com/clemenko/rke_install_blog
+
+Even air gapping the PX-CSI is easy : https://youtu.be/SJHFvABdvUA
+
