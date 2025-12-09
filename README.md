@@ -50,3 +50,7 @@ Check out https://andyc.info/tubes
 I have a blog for that too : https://github.com/clemenko/rke_install_blog
 
 Even air gapping the PX-CSI is easy : https://youtu.be/SJHFvABdvUA
+
+## Success
+
+![success](https://raw.githubusercontent.com/clemenko/hobbyfarm/main/images/success.jpg)
