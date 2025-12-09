@@ -320,6 +320,10 @@ function demo () {
 
   echo -e -n " - flask ";kubectl apply -f https://raw.githubusercontent.com/clemenko/k8s_yaml/master/flask_simple_nginx.yml > /dev/null 2>&1; info_ok
   
+  echo -e -n " - minio"
+  helm upgrade -i minio minio --repo https://charts.min.io -n minio --set rootUser=admin,rootPassword=$password --create-namespace --set mode=standalone --set resources.requests.memory=1Gi --set persistence.size=10Gi --set mode=standalone --set ingress.enabled=true --set ingress.hosts[0]=s3.$domain --set consoleIngress.enabled=true --set consoleIngress.hosts[0]=minio.$domain --set ingress.annotations."nginx\.ingress\.kubernetes\.io/proxy-body-size"="1024m" --set consoleIngress.annotations."nginx\.ingress\.kubernetes\.io/proxy-body-size"="1024m" --set image.repository=cgr.dev/chainguard/minio --set image.tag=latest > /dev/null 2>&1
+  info_ok
+
   echo -e -n " - harbor"
   helm upgrade -i harbor harbor --repo https://helm.goharbor.io -n harbor --create-namespace --set expose.tls.certSource=secret --set expose.tls.secret.secretName=tls-ingress --set expose.tls.enabled=false --set expose.tls.auto.commonName=harbor.$domain --set expose.ingress.hosts.core=harbor.$domain --set persistence.enabled=true --set harborAdminPassword=$password --set externalURL=http://harbor.$domain --set notary.enabled=false > /dev/null 2>&1;
   info_ok
