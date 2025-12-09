@@ -216,7 +216,7 @@ info_ok
 ################################ rancher ##############################
 function rancher () {
 
-  if [[ -z $(dolist | awk '{printf $3","}' | sed 's/,$//') ]] && ! kubectl get node > /dev/null 2>&1 ; then
+  if [[ ! -f ip.txt ]] && ! kubectl get node > /dev/null 2>&1 ; then
     echo -e "$BLUE" "Building cluster first." "$NO_COLOR"
     up && longhorn
   fi
