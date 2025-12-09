@@ -6,7 +6,6 @@ This repo is for the Caffeinate and Collaboriate Webinar.
 
 https://www.purestorage.com/events/webinars/caffeinate-and-collaborate-pure-partner-webinar-series.html
 
-
 **Pure + Rancher: Containers without Complexity**
 Andy Clemenko, Systems Engineer Federal Defense Pure Storage and Greg Carl, Principal Technologist Pure Storage
 
@@ -38,6 +37,10 @@ secret sauce, or the `pure_harvester.sh` command. could go either way.
 
 `./pure_harvester.sh demo`
 
+## slide deck
+
+Can be viewed here : [caffine_Collab.pdf](caffine_Collab.pdf)
+
 ## Other videos
 
 Check out https://andyc.info/tubes
@@ -47,4 +50,3 @@ Check out https://andyc.info/tubes
 I have a blog for that too : https://github.com/clemenko/rke_install_blog
 
 Even air gapping the PX-CSI is easy : https://youtu.be/SJHFvABdvUA
-
